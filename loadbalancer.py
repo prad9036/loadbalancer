@@ -158,7 +158,7 @@ def route_dl(hash, filename):
 
 
 @app.route("/watch/<hash>")
-def route_dl(hash, filename):
+def route_watch(hash, filename):
 
     # Track total usage per hash
     USAGE[hash] = USAGE.get(hash, 0) + 1
