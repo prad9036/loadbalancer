@@ -157,39 +157,40 @@ def route_dl(hash, filename):
     return redirect(final_url, code=301)
 
 
-@app.route("/watch/<hash_value>", methods=["GET"])
-def watch(hash_value):
-    global CDN_INSTANCES, LIVENESS, USAGE, IP_USAGE
+@app.route("/watch/<hash>")
+def route_dl(hash, filename):
 
-    # --- pick CDN ---
-    target = pick_best_cdn()
-    if not target:
-        return jsonify({"error": "No CDN instances available"}), 503
+    # Track total usage per hash
+    USAGE[hash] = USAGE.get(hash, 0) + 1
 
-    # --- usage tracking ---
-    USAGE[hash_value] = USAGE.get(hash_value, 0) + 1
+    # Determine client IP
+    client_ip = request.headers.get("X-Forwarded-For",
+                    request.remote_addr).split(",")[0].strip()
 
-    ip = request.remote_addr
-    if ip not in IP_USAGE:
-        IP_USAGE[ip] = {}
+    # Track per-IP usage
+    if client_ip not in IP_USAGE:
+        IP_USAGE[client_ip] = {}
 
-    IP_USAGE[ip][hash_value] = IP_USAGE[ip].get(hash_value, 0) + 1
-    if IP_USAGE[ip][hash_value] > MAX_REQUESTS_PER_IP:
+    IP_USAGE[client_ip][hash] = IP_USAGE[client_ip].get(hash, 0) + 1
+
+    # Enforce per-IP-per-file limit
+    if IP_USAGE[client_ip][hash] > MAX_REQUESTS_PER_IP:
         return jsonify({
-            "error": "Rate limit exceeded",
-            "ip": ip,
-            "hash": hash_value,
-            "limit": MAX_REQUESTS_PER_IP
+            "error": "IP limit exceeded",
+            "allowed": MAX_REQUESTS_PER_IP,
+            "your_requests": IP_USAGE[client_ip][hash],
+            "hash": hash,
+            "ip": client_ip
         }), 429
 
-    # --- STRICT redirect path ---
-    #   final → https://<instance>/watch/<hash>
-    final_url = f"{target}/watch/{hash_value}"
+    # Pick best CDN
+    server = choose_cdn()
+    if not server:
+        return "No CDN servers online", 503
 
-    print("WATCH REDIRECT:", final_url)   # debug print (remove later)
-
+    # Final redirect target (permanent)
+    final_url = f"{server}/watch/{hash}"
     return redirect(final_url, code=301)
-
 
 # ============================================================
 # Stats endpoint for debugging/monitoring
