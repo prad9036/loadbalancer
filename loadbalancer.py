@@ -157,6 +157,40 @@ def route_dl(hash, filename):
     return redirect(final_url, code=301)
 
 
+@app.route("/watch/<hash_value>", methods=["GET"])
+def watch(hash_value):
+    global CDN_INSTANCES, LIVENESS, USAGE, IP_USAGE
+
+    # Choose least-loaded CDN
+    target = pick_best_cdn()
+    if not target:
+        return jsonify({"error": "No active CDN instances"}), 503
+
+    # Global hash usage count
+    USAGE[hash_value] = USAGE.get(hash_value, 0) + 1
+
+    # Per-IP limiter
+    ip = request.remote_addr
+    if ip not in IP_USAGE:
+        IP_USAGE[ip] = {}
+
+    IP_USAGE[ip][hash_value] = IP_USAGE[ip].get(hash_value, 0) + 1
+
+    if IP_USAGE[ip][hash_value] > MAX_REQUESTS_PER_IP:
+        return jsonify({
+            "error": "Rate limit exceeded",
+            "ip": ip,
+            "hash": hash_value,
+            "limit": MAX_REQUESTS_PER_IP
+        }), 429
+
+    # Build redirect URL same as client requested
+    final_url = f"{target}/watch/{hash_value}"
+
+    # Permanent redirect (browser/player won’t call balancer again)
+    return redirect(final_url, code=301)
+
+
 # ============================================================
 # Stats endpoint for debugging/monitoring
 # ============================================================
