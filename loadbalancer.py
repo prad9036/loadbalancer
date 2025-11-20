@@ -5,42 +5,60 @@ from flask import Flask, redirect, request, jsonify
 
 app = Flask(__name__)
 
-# CDN server registry
-# Example:
+# ============================================================
+# CDN registry:
 # {
-#   "https://xxxx.trycloudflare.com": {
-#        "status": {...}, 
+#   "https://abc.trycloudflare.com": {
+#        "status": {...},
+#        "load": 3,
 #        "last_ok": True
 #   }
 # }
+# ============================================================
+
 CDN_SERVERS = {}
 
-# Global usage tracker for each hash
+# Track usage per hash
 USAGE = {}
 
-# Per-IP per-hash usage limiter
-IP_USAGE = {}   # { ip: { hash: count } }
+# Per-IP tracking
+IP_USAGE = {}       # { ip: { hash: count } }
+MAX_REQUESTS_PER_IP = 10
 
-# Set the maximum allowed requests for 1 IP on one file hash
-MAX_REQUESTS_PER_IP = 10   # adjust if needed
-
-# Polling interval for /status
-POLL_INTERVAL = 10
+POLL_INTERVAL = 10     # seconds
 
 
 # ============================================================
-# Background poller thread: checks all CDN server /status
+# Background POLLER - fetch CDN /status
 # ============================================================
+
 def poller():
     while True:
         for base_url in list(CDN_SERVERS.keys()):
-            status_url = f"{base_url.rstrip('/')}/status"
+            status_url = f"{base_url}/status"
+
             try:
                 resp = requests.get(status_url, timeout=4)
-                CDN_SERVERS[base_url]["status"] = resp.json()
+                status_json = resp.json()
+
+                # Extract load
+                loads = status_json.get("loads", {})
+                if isinstance(loads, dict):
+                    total_load = sum(loads.values())
+                else:
+                    total_load = 99999
+
+                # Update info
+                CDN_SERVERS[base_url]["status"] = status_json
+                CDN_SERVERS[base_url]["load"] = total_load
                 CDN_SERVERS[base_url]["last_ok"] = True
-            except:
+
+            except Exception:
+                # Mark server DOWN
                 CDN_SERVERS[base_url]["last_ok"] = False
+                CDN_SERVERS[base_url]["status"] = {}
+                CDN_SERVERS[base_url]["load"] = 99999
+
         time.sleep(POLL_INTERVAL)
 
 
@@ -48,20 +66,18 @@ threading.Thread(target=poller, daemon=True).start()
 
 
 # ============================================================
-# API: Add new CDN instance dynamically
+# API: add one or more CDN servers dynamically
 # ============================================================
-@app.route('/add_cdn', methods=['POST'])
-def add_cdn():
-    global CDN_SERVERS
 
+@app.route("/add_cdn", methods=["POST"])
+def add_cdn():
     data = request.json or {}
+
     urls = []
 
-    # Support: { "url": "one" }
     if "url" in data:
         urls.append(data["url"])
 
-    # Support: { "urls": ["a","b"] }
     if "urls" in data:
         if not isinstance(data["urls"], list):
             return jsonify({"error": "urls must be a list"}), 400
@@ -75,13 +91,11 @@ def add_cdn():
     for url in urls:
         url = url.strip().rstrip("/")
         if url.startswith("http://") or url.startswith("https://"):
-            # store default object
+
             CDN_SERVERS[url] = {
-                "status": "unknown",
-                "load": None,
-                "connected_bots": None,
-                "uptime": None,
-                "version": None
+                "status": {},
+                "load": 99999,
+                "last_ok": False
             }
 
             added.append(url)
@@ -93,51 +107,46 @@ def add_cdn():
 
 
 # ============================================================
-# Load selection logic — picks least-loaded CDN
+# Load selection logic
 # ============================================================
+
 def choose_cdn():
     best_server = None
     best_load = None
 
-    for base_url, info in CDN_SERVERS.items():
+    for url, info in CDN_SERVERS.items():
         if not info.get("last_ok"):
             continue
 
-        status = info.get("status", {})
-        loads = status.get("loads", {})
+        load = info.get("load", 99999)
 
-        if not loads:
-            continue
-
-        total_load = sum(loads.values())
-
-        if best_load is None or total_load < best_load:
-            best_load = total_load
-            best_server = base_url
+        if best_load is None or load < best_load:
+            best_load = load
+            best_server = url
 
     return best_server
 
 
 # ============================================================
-# Main DL endpoint with per-IP limit + usage tracking
+# DL ROUTE: /dl/<hash>/<filename>
 # ============================================================
+
 @app.route("/dl/<hash>/<path:filename>")
 def route_dl(hash, filename):
 
-    # Track total usage per hash
+    # Count global usage
     USAGE[hash] = USAGE.get(hash, 0) + 1
 
     # Determine client IP
     client_ip = request.headers.get("X-Forwarded-For",
                     request.remote_addr).split(",")[0].strip()
 
-    # Track per-IP usage
+    # Per-IP usage
     if client_ip not in IP_USAGE:
         IP_USAGE[client_ip] = {}
 
     IP_USAGE[client_ip][hash] = IP_USAGE[client_ip].get(hash, 0) + 1
 
-    # Enforce per-IP-per-file limit
     if IP_USAGE[client_ip][hash] > MAX_REQUESTS_PER_IP:
         return jsonify({
             "error": "IP limit exceeded",
@@ -147,33 +156,35 @@ def route_dl(hash, filename):
             "ip": client_ip
         }), 429
 
-    # Pick best CDN
+    # Pick least-loaded CDN
     server = choose_cdn()
     if not server:
-        return "No CDN servers online", 503
+        return "No CDN instance online", 503
 
-    # Final redirect target (permanent)
     final_url = f"{server}/dl/{hash}/{filename}"
     return redirect(final_url, code=301)
 
 
+# ============================================================
+# WATCH ROUTE: /watch/<hash>
+# ============================================================
+
 @app.route("/watch/<hash>")
 def route_watch(hash):
 
-    # Track total usage per hash
+    # Count global usage
     USAGE[hash] = USAGE.get(hash, 0) + 1
 
     # Determine client IP
     client_ip = request.headers.get("X-Forwarded-For",
                     request.remote_addr).split(",")[0].strip()
 
-    # Track per-IP usage
+    # Per-IP usage
     if client_ip not in IP_USAGE:
         IP_USAGE[client_ip] = {}
 
     IP_USAGE[client_ip][hash] = IP_USAGE[client_ip].get(hash, 0) + 1
 
-    # Enforce per-IP-per-file limit
     if IP_USAGE[client_ip][hash] > MAX_REQUESTS_PER_IP:
         return jsonify({
             "error": "IP limit exceeded",
@@ -183,18 +194,19 @@ def route_watch(hash):
             "ip": client_ip
         }), 429
 
-    # Pick best CDN
+    # Pick least-loaded CDN
     server = choose_cdn()
     if not server:
-        return "No CDN servers online", 503
+        return "No CDN instance online", 503
 
-    # Final redirect target (permanent)
     final_url = f"{server}/watch/{hash}"
     return redirect(final_url, code=301)
 
+
 # ============================================================
-# Stats endpoint for debugging/monitoring
+# Stats
 # ============================================================
+
 @app.route("/stats")
 def stats():
     return jsonify({
@@ -207,6 +219,7 @@ def stats():
 # ============================================================
 # Run
 # ============================================================
+
 if __name__ == "__main__":
     print("Load balancer running on 0.0.0.0:8080")
     app.run(host="0.0.0.0", port=8080)
