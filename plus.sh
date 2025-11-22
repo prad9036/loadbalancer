@@ -1,22 +1,39 @@
 #!/bin/bash
 
-# Start cloudflared
-nohup ./cloudflared tunnel --url http://localhost:8082 >8082.log 2>&1 &
+# Clone + install WebStreamer
+git clone https://github.com/prad9036/filestream-deekshit
+cd filestream-deekshit
 
-# Start WebStreamer
-nohup python -m WebStreamer >ws.log 2>&1 &
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
 
-# Wait for Gunicorn on 8080
+nohup python -m WebStreamer > ws.log 2>&1 &
+cd /workspace
+
+
+# Start cloudflared (make sure log stays in /workspace)
+curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+chmod +x cloudflared
+nohup ./cloudflared tunnel --url http://localhost:8082 > /workspace/8082.log 2>&1 &
+
+
+# Wait for gunicorn on 8080
 while ! nc -z localhost 8080; do
     sleep 1
 done
 
-# Wait for a Cloudflare URL
-while ! grep -Eo "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" 8082.log >/dev/null; do
+
+# Wait until cloudflared generates a URL
+while ! grep -Eo "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" /workspace/8082.log >/dev/null 2>&1; do
     sleep 1
 done
 
-# Add CDN
+
+# Extract latest URL
+cdn_url=$(grep -Eo "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" /workspace/8082.log | tail -n 1)
+
+# Add CDN to loadbalancer
 curl "http://localhost:8080/add_cdn" \
     -H 'content-type: application/json' \
-    -d "{\"url\":\"$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' 8082.log | tail -n 1)\"}"
+    -d "{\"url\":\"$cdn_url\"}"
