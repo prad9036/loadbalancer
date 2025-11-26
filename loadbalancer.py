@@ -10,44 +10,36 @@ load_dotenv()
 app = Flask(__name__)
 
 # ============================================================
+# SPECIAL HASH REDIRECT (FROM ENV + RUNTIME ADD)
+# ============================================================
+
+ENV_SPECIAL = os.getenv("LB_SPECIAL_HASHES", "")
+SPECIAL_HASHES = set([h.strip() for h in ENV_SPECIAL.split(",") if h.strip()])
+
+TG_REDIRECT = "https://t.me/ppsl24_bot"
+
+# ============================================================
 # ENV CONFIGURATION
 # ============================================================
 
-# Sliding window: max number of requests allowed per IP per hash
 MAX_REQUESTS_PER_IP = int(os.getenv("LB_MAX_REQUESTS_PER_IP", "10"))
-
-# Time window (seconds)
 TTL_SECONDS = int(os.getenv("LB_TTL_SECONDS", str(5 * 3600)))
-
-# Poll interval for CDN health checks
 POLL_INTERVAL = int(os.getenv("LB_POLL_INTERVAL", "10"))
-
-# Comma-separated CDN URLs
 ENV_CDNS = os.getenv("LB_CDN_URLS", "")
-
-# Debug log?
 DEBUG = os.getenv("LB_DEBUG", "0") == "1"
-
 
 def dbg(*a):
     if DEBUG:
         print("[DEBUG]", *a)
 
-# Type of redirects: 301 (permanent) or 302 (temporary)
 REDIRECT_CODE = int(os.getenv("LB_REDIRECT_CODE", "302"))
 
 # ============================================================
 # DATA STRUCTURES
 # ============================================================
 
-# CDN registry
 CDN_SERVERS = {}
-
-# Global hash usage (just a counter)
 USAGE = {}
-
-# Per-IP per-hash timestamps
-# { ip: { hash: [ts1, ts2, ...] } }
 IP_USAGE = {}
 
 # ============================================================
@@ -64,7 +56,6 @@ if ENV_CDNS.strip():
                 "last_ok": False
             }
 
-
 # ============================================================
 # TTL CLEANUP LOOP
 # ============================================================
@@ -78,7 +69,6 @@ def cleanup_loop():
             empty_hashes = []
 
             for h, ts_list in hashes.items():
-                # keep timestamps only within TTL
                 new_ts = [ts for ts in ts_list if now - ts <= TTL_SECONDS]
                 if new_ts:
                     IP_USAGE[ip][h] = new_ts
@@ -96,12 +86,10 @@ def cleanup_loop():
 
         time.sleep(60)
 
-
 threading.Thread(target=cleanup_loop, daemon=True).start()
 
-
 # ============================================================
-# CDN POLLER /status
+# CDN POLLER
 # ============================================================
 
 def poller():
@@ -132,9 +120,7 @@ def poller():
 
         time.sleep(POLL_INTERVAL)
 
-
 threading.Thread(target=poller, daemon=True).start()
-
 
 # ============================================================
 # ADD CDN
@@ -170,6 +156,35 @@ def add_cdn():
 
     return jsonify({"added": added, "total_instances": len(CDN_SERVERS)})
 
+# ============================================================
+# SPECIAL HASH ENDPOINTS
+# ============================================================
+
+@app.route("/add_special", methods=["POST"])
+def add_special():
+    data = request.json or {}
+    incoming = data.get("hashes")
+
+    if not incoming or not isinstance(incoming, list):
+        return jsonify({"error": "Provide list under 'hashes'"}), 400
+
+    added = []
+    for h in incoming:
+        if isinstance(h, str) and h.strip():
+            h = h.strip()
+            SPECIAL_HASHES.add(h)
+            added.append(h)
+
+    return jsonify({
+        "added": added,
+        "total_special": len(SPECIAL_HASHES)
+    })
+
+@app.route("/special")
+def special_list():
+    return jsonify({
+        "special_hashes": sorted(list(SPECIAL_HASHES))
+    })
 
 # ============================================================
 # LOAD SELECTION
@@ -184,16 +199,14 @@ def choose_cdn():
             continue
 
         load = info.get("load", 99999)
-
         if best_load is None or load < best_load:
             best_load = load
             best_url = url
 
     return best_url
 
-
 # ============================================================
-# RECORD IP USAGE (SLIDING WINDOW)
+# RECORD IP USAGE
 # ============================================================
 
 def record_ip_usage(ip, h):
@@ -205,29 +218,29 @@ def record_ip_usage(ip, h):
     if h not in IP_USAGE[ip]:
         IP_USAGE[ip][h] = []
 
-    timestamps = IP_USAGE[ip][h]
-
-    # prune old
-    timestamps = [ts for ts in timestamps if now - ts <= TTL_SECONDS]
-
-    # add new
+    timestamps = [ts for ts in IP_USAGE[ip][h] if now - ts <= TTL_SECONDS]
     timestamps.append(now)
-
     IP_USAGE[ip][h] = timestamps
 
     return len(timestamps)
 
-
 # ============================================================
-# DOWNLOAD REDIRECT
+# DOWNLOAD ROUTE
 # ============================================================
 
 @app.route("/dl/<hash>/<path:filename>")
 def route_dl(hash, filename):
+
+    # SPECIAL HASH REDIRECT
+    if hash in SPECIAL_HASHES:
+        return redirect(TG_REDIRECT, code=302)
+
     USAGE[hash] = USAGE.get(hash, 0) + 1
 
-    client_ip = request.headers.get("X-Forwarded-For",
-                   request.remote_addr).split(",")[0].strip()
+    client_ip = request.headers.get(
+        "X-Forwarded-For",
+        request.remote_addr
+    ).split(",")[0].strip()
 
     count = record_ip_usage(client_ip, hash)
     if MAX_REQUESTS_PER_IP > 0 and count > MAX_REQUESTS_PER_IP:
@@ -247,17 +260,23 @@ def route_dl(hash, filename):
     final_url = f"{cdn}/dl/{hash}/{filename}"
     return redirect(final_url, code=REDIRECT_CODE)
 
-
 # ============================================================
-# WATCH REDIRECT
+# WATCH ROUTE
 # ============================================================
 
 @app.route("/watch/<hash>")
 def route_watch(hash):
+
+    # SPECIAL HASH REDIRECT
+    if hash in SPECIAL_HASHES:
+        return redirect(TG_REDIRECT, code=302)
+
     USAGE[hash] = USAGE.get(hash, 0) + 1
 
-    client_ip = request.headers.get("X-Forwarded-For",
-                   request.remote_addr).split(",")[0].strip()
+    client_ip = request.headers.get(
+        "X-Forwarded-For",
+        request.remote_addr
+    ).split(",")[0].strip()
 
     count = record_ip_usage(client_ip, hash)
     if count > MAX_REQUESTS_PER_IP:
@@ -277,7 +296,6 @@ def route_watch(hash):
     final_url = f"{cdn}/watch/{hash}"
     return redirect(final_url, code=REDIRECT_CODE)
 
-
 # ============================================================
 # STATS
 # ============================================================
@@ -287,9 +305,9 @@ def stats():
     return jsonify({
         "servers": CDN_SERVERS,
         "usage": USAGE,
-        "ip_usage": IP_USAGE
+        "ip_usage": IP_USAGE,
+        "special_hashes": sorted(list(SPECIAL_HASHES))
     })
-
 
 # ============================================================
 # RUN
