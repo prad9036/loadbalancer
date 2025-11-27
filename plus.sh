@@ -5,9 +5,9 @@ git clone https://github.com/prad9036/filestream-deekshit
 cd filestream-deekshit
 
 # Checkout the most recent commit (by commit date)
-git fetch --all
-latest_commit=$(git rev-list --all --max-count=1 --date-order)
-git checkout "$latest_commit"
+#git fetch --all
+#latest_commit=$(git rev-list --all --max-count=1 --date-order)
+#git checkout "$latest_commit"
 
 # Install environment + start WebStreamer
 python3 -m venv .venv
