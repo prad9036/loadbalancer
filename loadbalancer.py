@@ -1,320 +1,248 @@
 import os
-import threading
 import time
+import threading
 import requests
-from flask import Flask, redirect, request, jsonify
+import redis
+import lmdb
+import json
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import RedirectResponse, JSONResponse
 from dotenv import load_dotenv
+from urllib.parse import urlparse
 
 load_dotenv()
 
-app = Flask(__name__)
-
 # ============================================================
-# SPECIAL HASH REDIRECT (FROM ENV + RUNTIME ADD)
+# CONFIG
 # ============================================================
 
-ENV_SPECIAL = os.getenv("LB_SPECIAL_HASHES", "")
-SPECIAL_HASHES = set([h.strip() for h in ENV_SPECIAL.split(",") if h.strip()])
-
+ADMIN_KEY = os.getenv("LB_ADMIN_KEY")
+REDIS_URL = os.getenv("REDIS_URL")
 TG_REDIRECT = "https://t.me/ppsl24_bot"
 
-# ============================================================
-# ENV CONFIGURATION
-# ============================================================
-
 MAX_REQUESTS_PER_IP = int(os.getenv("LB_MAX_REQUESTS_PER_IP", "10"))
-TTL_SECONDS = int(os.getenv("LB_TTL_SECONDS", str(5 * 3600)))
+TTL_SECONDS = int(os.getenv("LB_TTL_SECONDS", "18000"))
 POLL_INTERVAL = int(os.getenv("LB_POLL_INTERVAL", "10"))
-ENV_CDNS = os.getenv("LB_CDN_URLS", "")
+REDIRECT_CODE = int(os.getenv("LB_REDIRECT_CODE", "302"))
+
+REFERER_WHITELIST = {
+    d.strip().lower()
+    for d in os.getenv("LB_REFERER_WHITELIST", "").split(",")
+    if d.strip()
+}
+
 DEBUG = os.getenv("LB_DEBUG", "0") == "1"
 
 def dbg(*a):
     if DEBUG:
         print("[DEBUG]", *a)
 
-REDIRECT_CODE = int(os.getenv("LB_REDIRECT_CODE", "302"))
-
 # ============================================================
-# DATA STRUCTURES
+# FASTAPI APP
 # ============================================================
 
-CDN_SERVERS = {}
-USAGE = {}
-IP_USAGE = {}
+app = FastAPI()
 
 # ============================================================
-# INITIALIZE CDN SERVERS FROM ENV
+# REDIS (SPECIAL HASHES)
 # ============================================================
 
-if ENV_CDNS.strip():
-    for url in ENV_CDNS.split(","):
-        url = url.strip().rstrip("/")
-        if url.startswith("http://") or url.startswith("https://"):
-            CDN_SERVERS[url] = {
-                "status": {},
-                "load": 99999,
-                "last_ok": False
-            }
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+SPECIAL_CACHE = {"set": set()}
 
-# ============================================================
-# TTL CLEANUP LOOP
-# ============================================================
+def load_special_hashes():
+    SPECIAL_CACHE["set"] = set(r.smembers("special_hashes"))
+    dbg("Loaded special hashes:", len(SPECIAL_CACHE["set"]))
 
-def cleanup_loop():
+load_special_hashes()
+
+def refresh_specials_loop():
     while True:
-        now = time.time()
-        empty_ips = []
-
-        for ip, hashes in list(IP_USAGE.items()):
-            empty_hashes = []
-
-            for h, ts_list in hashes.items():
-                new_ts = [ts for ts in ts_list if now - ts <= TTL_SECONDS]
-                if new_ts:
-                    IP_USAGE[ip][h] = new_ts
-                else:
-                    empty_hashes.append(h)
-
-            for h in empty_hashes:
-                del IP_USAGE[ip][h]
-
-            if not IP_USAGE[ip]:
-                empty_ips.append(ip)
-
-        for ip in empty_ips:
-            del IP_USAGE[ip]
-
+        load_special_hashes()
         time.sleep(60)
 
-threading.Thread(target=cleanup_loop, daemon=True).start()
+threading.Thread(target=refresh_specials_loop, daemon=True).start()
+
+def is_special(h):
+    return h in SPECIAL_CACHE["set"]
 
 # ============================================================
-# CDN POLLER
+# LMDB FOR CDNS
 # ============================================================
+
+LMDB_PATH = "cdn.lmdb"
+LMDB_MAP_SIZE = 512 * 1024 * 1024  # 512MB
+_env = lmdb.open(LMDB_PATH, map_size=LMDB_MAP_SIZE, max_dbs=1, lock=True, sync=False, readahead=False)
+_lmdb_lock = threading.Lock()
+
+def set_cdn(url, data):
+    data["_ts"] = int(time.time())
+    with _lmdb_lock:
+        with _env.begin(write=True) as txn:
+            txn.put(url.encode(), json.dumps(data).encode())
+
+def get_cdn(url):
+    with _env.begin() as txn:
+        v = txn.get(url.encode())
+        return json.loads(v) if v else None
+
+def list_cdns():
+    cdns = {}
+    with _env.begin() as txn:
+        for k, v in txn.cursor():
+            cdns[k.decode()] = json.loads(v)
+    return cdns
+
+# ============================================================
+# INIT CDNS FROM ENV
+# ============================================================
+
+ENV_CDNS = os.getenv("LB_CDN_URLS", "")
+if ENV_CDNS:
+    for url in ENV_CDNS.split(","):
+        url = url.strip().rstrip("/")
+        if url.startswith("http") and not get_cdn(url):
+            set_cdn(url, {"load": 99999, "last_ok": 0})
+
+# ============================================================
+# UTILS
+# ============================================================
+
+BEST_CDN = {"url": None, "ts": 0}
+BEST_CDN_TTL = 10
+LOCAL_RL = {}
+
+def get_best_cdn():
+    now = time.time()
+    if BEST_CDN["url"] and now - BEST_CDN["ts"] < BEST_CDN_TTL:
+        return BEST_CDN["url"]
+
+    cdns = list_cdns()
+    online = [(url, meta) for url, meta in cdns.items() if meta.get("last_ok") == 1]
+    if not online:
+        return None
+
+    best = min(online, key=lambda x: x[1].get("load", 99999))
+    BEST_CDN["url"] = best[0]
+    BEST_CDN["ts"] = now
+    return best[0]
+
+def record_ip(ip, h):
+    now = time.time()
+    key = f"{ip}:{h}"
+    hits = LOCAL_RL.get(key, [])
+    hits = [t for t in hits if now - t < TTL_SECONDS]
+    hits.append(now)
+    LOCAL_RL[key] = hits
+    return len(hits)
+
+def referer_blocked(request: Request):
+    ref = request.headers.get("referer")
+    if not ref:
+        return False
+    host = (urlparse(ref).hostname or "").lower()
+    return not any(host.endswith(w) for w in REFERER_WHITELIST)
+
+def require_admin(request: Request):
+    if request.headers.get("x-admin-key") != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+# ============================================================
+# POLLER (LEADER ONLY)
+# ============================================================
+
+IS_LEADER = os.getenv("KOYEB_INSTANCE_ID", "").endswith("0")
 
 def poller():
     while True:
-        for base_url in list(CDN_SERVERS.keys()):
-            status_url = f"{base_url}/status"
-
+        best_url = None
+        best_load = None
+        now = int(time.time())
+        for url, meta in list_cdns().items():
             try:
-                resp = requests.get(status_url, timeout=4)
-                status_json = resp.json()
+                resp = requests.get(f"{url}/status", timeout=4)
+                js = resp.json()
+                loads = js.get("loads", {})
+                total = sum(loads.values()) if isinstance(loads, dict) else 99999
 
-                loads = status_json.get("loads", {})
-                if isinstance(loads, dict):
-                    total_load = sum(loads.values())
-                else:
-                    total_load = 99999
+                set_cdn(url, {"load": total, "last_ok": 1, "updated_at": now})
 
-                CDN_SERVERS[base_url]["status"] = status_json
-                CDN_SERVERS[base_url]["load"] = total_load
-                CDN_SERVERS[base_url]["last_ok"] = True
-                dbg(f"OK {base_url}: load={total_load}")
+                if best_load is None or total < best_load:
+                    best_load = total
+                    best_url = url
 
-            except Exception as e:
-                CDN_SERVERS[base_url]["last_ok"] = False
-                CDN_SERVERS[base_url]["status"] = {}
-                CDN_SERVERS[base_url]["load"] = 99999
-                dbg(f"DOWN {base_url}: {e}")
+            except Exception:
+                set_cdn(url, {"load": 99999, "last_ok": 0, "updated_at": now})
+
+        if best_url:
+            BEST_CDN["url"] = best_url
+            BEST_CDN["ts"] = time.time()
 
         time.sleep(POLL_INTERVAL)
 
-threading.Thread(target=poller, daemon=True).start()
+if IS_LEADER:
+    threading.Thread(target=poller, daemon=True).start()
 
 # ============================================================
-# ADD CDN
+# ROUTES
 # ============================================================
 
-@app.route("/add_cdn", methods=["POST"])
-def add_cdn():
-    data = request.json or {}
-    urls = []
+@app.get("/health")
+async def health():
+    return "ok"
 
-    if "url" in data:
-        urls.append(data["url"])
-
-    if "urls" in data:
-        if not isinstance(data["urls"], list):
-            return jsonify({"error": "urls must be a list"}), 400
-        urls.extend(data["urls"])
-
-    if not urls:
-        return jsonify({"error": "no URLs provided"}), 400
-
+@app.post("/add_cdn")
+async def add_cdn(request: Request):
+    require_admin(request)
+    data = await request.json()
+    urls = data.get("urls", [])
     added = []
+    for u in urls:
+        if u.startswith("http"):
+            u = u.rstrip("/")
+            if not get_cdn(u):
+                set_cdn(u, {"load": 99999, "last_ok": 0})
+                added.append(u)
+    return {"added": added}
 
-    for url in urls:
-        url = url.strip().rstrip("/")
-        if url.startswith("http://") or url.startswith("https://"):
-            CDN_SERVERS[url] = {
-                "status": {},
-                "load": 99999,
-                "last_ok": False
-            }
-            added.append(url)
+@app.post("/add_special")
+async def add_special(request: Request):
+    require_admin(request)
+    data = await request.json()
+    hashes = data.get("hashes", [])
+    for h in hashes:
+        r.sadd("special_hashes", h)
+    load_special_hashes()
+    return {"added": hashes}
 
-    return jsonify({"added": added, "total_instances": len(CDN_SERVERS)})
-
-# ============================================================
-# SPECIAL HASH ENDPOINTS
-# ============================================================
-
-@app.route("/add_special", methods=["POST"])
-def add_special():
-    data = request.json or {}
-    incoming = data.get("hashes")
-
-    if not incoming or not isinstance(incoming, list):
-        return jsonify({"error": "Provide list under 'hashes'"}), 400
-
-    added = []
-    for h in incoming:
-        if isinstance(h, str) and h.strip():
-            h = h.strip()
-            SPECIAL_HASHES.add(h)
-            added.append(h)
-
-    return jsonify({
-        "added": added,
-        "total_special": len(SPECIAL_HASHES)
-    })
-
-@app.route("/special")
-def special_list():
-    return jsonify({
-        "special_hashes": sorted(list(SPECIAL_HASHES))
-    })
-
-# ============================================================
-# LOAD SELECTION
-# ============================================================
-
-def choose_cdn():
-    best_url = None
-    best_load = None
-
-    for url, info in CDN_SERVERS.items():
-        if not info.get("last_ok"):
-            continue
-
-        load = info.get("load", 99999)
-        if best_load is None or load < best_load:
-            best_load = load
-            best_url = url
-
-    return best_url
-
-# ============================================================
-# RECORD IP USAGE
-# ============================================================
-
-def record_ip_usage(ip, h):
-    now = time.time()
-
-    if ip not in IP_USAGE:
-        IP_USAGE[ip] = {}
-
-    if h not in IP_USAGE[ip]:
-        IP_USAGE[ip][h] = []
-
-    timestamps = [ts for ts in IP_USAGE[ip][h] if now - ts <= TTL_SECONDS]
-    timestamps.append(now)
-    IP_USAGE[ip][h] = timestamps
-
-    return len(timestamps)
-
-# ============================================================
-# DOWNLOAD ROUTE
-# ============================================================
-
-@app.route("/dl/<hash>/<path:filename>")
-def route_dl(hash, filename):
-
-    # SPECIAL HASH REDIRECT
-    if hash in SPECIAL_HASHES:
-        return redirect(TG_REDIRECT, code=302)
-
-    USAGE[hash] = USAGE.get(hash, 0) + 1
-
-    client_ip = request.headers.get(
-        "X-Forwarded-For",
-        request.remote_addr
-    ).split(",")[0].strip()
-
-    count = record_ip_usage(client_ip, hash)
-    if MAX_REQUESTS_PER_IP > 0 and count > MAX_REQUESTS_PER_IP:
-        return jsonify({
-            "error": "IP limit exceeded",
-            "allowed": MAX_REQUESTS_PER_IP,
-            "your_requests": count,
-            "window_seconds": TTL_SECONDS,
-            "hash": hash,
-            "ip": client_ip
-        }), 429
-
-    cdn = choose_cdn()
+@app.get("/dl/{hash}/{filename:path}")
+async def dl(hash: str, filename: str, request: Request):
+    if referer_blocked(request) or is_special(hash):
+        return RedirectResponse(TG_REDIRECT, status_code=302)
+    if record_ip(request.client.host, hash) > MAX_REQUESTS_PER_IP:
+        return JSONResponse({"error": "IP limit exceeded"}, status_code=429)
+    cdn = get_best_cdn()
     if not cdn:
-        return "No CDN instance online", 503
+        return JSONResponse({"error": "No CDN online"}, status_code=503)
+    return RedirectResponse(f"{cdn}/dl/{hash}/{filename}", status_code=REDIRECT_CODE)
 
-    final_url = f"{cdn}/dl/{hash}/{filename}"
-    return redirect(final_url, code=REDIRECT_CODE)
-
-# ============================================================
-# WATCH ROUTE
-# ============================================================
-
-@app.route("/watch/<hash>")
-def route_watch(hash):
-
-    # SPECIAL HASH REDIRECT
-    if hash in SPECIAL_HASHES:
-        return redirect(TG_REDIRECT, code=302)
-
-    USAGE[hash] = USAGE.get(hash, 0) + 1
-
-    client_ip = request.headers.get(
-        "X-Forwarded-For",
-        request.remote_addr
-    ).split(",")[0].strip()
-
-    count = record_ip_usage(client_ip, hash)
-    if count > MAX_REQUESTS_PER_IP:
-        return jsonify({
-            "error": "IP limit exceeded",
-            "allowed": MAX_REQUESTS_PER_IP,
-            "your_requests": count,
-            "window_seconds": TTL_SECONDS,
-            "hash": hash,
-            "ip": client_ip
-        }), 429
-
-    cdn = choose_cdn()
+@app.get("/watch/{hash}")
+async def watch(hash: str, request: Request):
+    if referer_blocked(request) or is_special(hash):
+        return RedirectResponse(TG_REDIRECT, status_code=302)
+    if record_ip(request.client.host, hash) > MAX_REQUESTS_PER_IP:
+        return JSONResponse({"error": "IP limit exceeded"}, status_code=429)
+    cdn = get_best_cdn()
     if not cdn:
-        return "No CDN instance online", 503
+        return JSONResponse({"error": "No CDN online"}, status_code=503)
+    return RedirectResponse(f"{cdn}/watch/{hash}", status_code=REDIRECT_CODE)
 
-    final_url = f"{cdn}/watch/{hash}"
-    return redirect(final_url, code=REDIRECT_CODE)
-
-# ============================================================
-# STATS
-# ============================================================
-
-@app.route("/stats")
-def stats():
-    return jsonify({
-        "servers": CDN_SERVERS,
-        "usage": USAGE,
-        "ip_usage": IP_USAGE,
-        "special_hashes": sorted(list(SPECIAL_HASHES))
-    })
-
-# ============================================================
-# RUN
-# ============================================================
-
-if __name__ == "__main__":
-    host = os.getenv("LB_HOST", "0.0.0.0")
-    port = int(os.getenv("LB_PORT", "8080"))
-    print(f"Load balancer running on {host}:{port}")
-    app.run(host=host, port=port)
+@app.get("/stats")
+async def stats(request: Request):
+    require_admin(request)
+    cdns = [{"url": url, **meta} for url, meta in list_cdns().items()]
+    return {
+        "cdns": cdns,
+        "best_cdn": BEST_CDN["url"],
+        "special_hashes": list(SPECIAL_CACHE["set"])
+    }
