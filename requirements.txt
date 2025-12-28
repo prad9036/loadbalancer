@@ -1,5 +1,6 @@
 redis
 lmdb
+uvicorn
 gunicorn
 flask
 requests
