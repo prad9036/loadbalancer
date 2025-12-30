@@ -37,9 +37,17 @@ for i in $(seq 1 "$NUM_TUNNELS"); do
     # Retry add_cdn until it returns HTTP 200, then stop
     while true; do
         status=$(curl -s -o /dev/null -w "%{http_code}" \
-                 -H "content-type: application/json" \
-                 -d "{\"url\":\"$url\"}" \
+                 -X POST \
+                 -H "Content-Type: application/json" \
+                 -H "X-Admin-key: $LB_ADMIN_KEY" \
+                 -d "{\"urls\":[\"$url\"]}" \
                  "http://localhost:8080/add_cdn")
+
+        echo "Response status: $status"
+
+        sleep 2  # optional delay between requests
+    done
+
 
         if [ "$status" -eq 200 ]; then
             echo "Tunnel $i registered successfully: $url"
