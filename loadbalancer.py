@@ -226,8 +226,8 @@ async def dl(hash: str, filename: str, request: Request):
         return JSONResponse({"error": "No CDN online"}, status_code=503)
     return RedirectResponse(f"{cdn}/dl/{hash}/{filename}", status_code=REDIRECT_CODE)
 
-@app.get("/watch/{hash}")
-async def watch(hash: str, request: Request):
+@app.get("/watch/{hash}/{filename:path}")
+async def watch(hash: str, filename: str, request: Request):
     if referer_blocked(request) or is_special(hash):
         return RedirectResponse(TG_REDIRECT, status_code=302)
     if record_ip(request.client.host, hash) > MAX_REQUESTS_PER_IP:
@@ -235,7 +235,7 @@ async def watch(hash: str, request: Request):
     cdn = get_best_cdn()
     if not cdn:
         return JSONResponse({"error": "No CDN online"}, status_code=503)
-    return RedirectResponse(f"{cdn}/watch/{hash}", status_code=REDIRECT_CODE)
+    return RedirectResponse(f"{cdn}/watch/{hash}/{filename}", status_code=REDIRECT_CODE)
 
 @app.get("/stats")
 async def stats(request: Request):
