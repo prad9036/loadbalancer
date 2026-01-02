@@ -5,6 +5,8 @@ import requests
 import redis
 import lmdb
 import json
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse
 from dotenv import load_dotenv
@@ -51,8 +53,11 @@ r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 SPECIAL_CACHE = {"set": set()}
 
 def load_special_hashes():
-    SPECIAL_CACHE["set"] = set(r.smembers("special_hashes"))
-    dbg("Loaded special hashes:", len(SPECIAL_CACHE["set"]))
+    try:
+        SPECIAL_CACHE["set"] = set(r.smembers("special_hashes"))
+        dbg("Loaded special hashes:", len(SPECIAL_CACHE["set"]))
+    except Exception as e:
+        dbg("Redis error:", e)
 
 load_special_hashes()
 
@@ -72,7 +77,14 @@ def is_special(h):
 
 LMDB_PATH = "cdn.lmdb"
 LMDB_MAP_SIZE = 512 * 1024 * 1024  # 512MB
-_env = lmdb.open(LMDB_PATH, map_size=LMDB_MAP_SIZE, max_dbs=1, lock=True, sync=False, readahead=False)
+_env = lmdb.open(
+    LMDB_PATH,
+    map_size=LMDB_MAP_SIZE,
+    max_dbs=1,
+    lock=True,
+    sync=False,
+    readahead=False
+)
 _lmdb_lock = threading.Lock()
 
 def set_cdn(url, data):
@@ -109,7 +121,7 @@ if ENV_CDNS:
 # ============================================================
 
 BEST_CDN = {"url": None, "ts": 0}
-BEST_CDN_TTL = 10
+BEST_CDN_TTL = 10  # seconds
 LOCAL_RL = {}
 
 def get_best_cdn():
@@ -122,10 +134,19 @@ def get_best_cdn():
     if not online:
         return None
 
-    best = min(online, key=lambda x: x[1].get("load", 99999))
-    BEST_CDN["url"] = best[0]
+    min_load = min(meta.get("load", 99999) for _, meta in online)
+
+    # tolerance allows "almost same load" to share traffic
+    TOLERANCE = 1
+    candidates = [
+        url for url, meta in online
+        if abs(meta.get("load", 99999) - min_load) <= TOLERANCE
+    ]
+
+    chosen = random.choice(candidates)
+    BEST_CDN["url"] = chosen
     BEST_CDN["ts"] = now
-    return best[0]
+    return chosen
 
 def record_ip(ip, h):
     now = time.time()
@@ -141,41 +162,68 @@ def referer_blocked(request: Request):
     if not ref:
         return False
     host = (urlparse(ref).hostname or "").lower()
-    return not any(host.endswith(w) for w in REFERER_WHITELIST)
+    return not any(
+        host == w or host.endswith("." + w)
+        for w in REFERER_WHITELIST
+    )
 
 def require_admin(request: Request):
     if request.headers.get("x-admin-key") != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 # ============================================================
-# POLLER (LEADER ONLY)
+# PARALLEL POLLER (LEADER ONLY)
 # ============================================================
 
 IS_LEADER = os.getenv("KOYEB_INSTANCE_ID", "").endswith("0")
 
+def check_cdn(url):
+    now = int(time.time())
+    try:
+        resp = requests.get(f"{url}/status", timeout=(2, 3))
+        js = resp.json()
+        loads = js.get("loads", {})
+        total = sum(loads.values()) if isinstance(loads, dict) else 99999
+
+        return {"url": url, "ok": True, "load": total, "ts": now}
+    except Exception:
+        return {"url": url, "ok": False, "load": 99999, "ts": now}
+
 def poller():
+    executor = ThreadPoolExecutor(max_workers=16)
+
     while True:
-        best_url = None
+        cdns = list_cdns()
+        futures = [executor.submit(check_cdn, url) for url in cdns.keys()]
+
         best_load = None
-        now = int(time.time())
-        for url, meta in list_cdns().items():
-            try:
-                resp = requests.get(f"{url}/status", timeout=4)
-                js = resp.json()
-                loads = js.get("loads", {})
-                total = sum(loads.values()) if isinstance(loads, dict) else 99999
+        best_urls = []
 
-                set_cdn(url, {"load": total, "last_ok": 1, "updated_at": now})
+        for fut in as_completed(futures):
+            res = fut.result()
+            url = res["url"]
 
-                if best_load is None or total < best_load:
-                    best_load = total
-                    best_url = url
+            if res["ok"]:
+                set_cdn(url, {
+                    "load": res["load"],
+                    "last_ok": 1,
+                    "updated_at": res["ts"]
+                })
 
-            except Exception:
-                set_cdn(url, {"load": 99999, "last_ok": 0, "updated_at": now})
+                if best_load is None or res["load"] < best_load:
+                    best_load = res["load"]
+                    best_urls = [url]
+                elif res["load"] == best_load:
+                    best_urls.append(url)
+            else:
+                set_cdn(url, {
+                    "load": 99999,
+                    "last_ok": 0,
+                    "updated_at": res["ts"]
+                })
 
-        if best_url:
-            BEST_CDN["url"] = best_url
+        if best_urls:
+            BEST_CDN["url"] = random.choice(best_urls)
             BEST_CDN["ts"] = time.time()
 
         time.sleep(POLL_INTERVAL)
@@ -195,25 +243,22 @@ async def health():
 async def add_cdn(request: Request):
     require_admin(request)
     data = await request.json()
-    urls = data.get("urls", [])
     added = []
-    for u in urls:
-        if u.startswith("http"):
-            u = u.rstrip("/")
-            if not get_cdn(u):
-                set_cdn(u, {"load": 99999, "last_ok": 0})
-                added.append(u)
+    for u in data.get("urls", []):
+        u = u.rstrip("/")
+        if u.startswith("http") and not get_cdn(u):
+            set_cdn(u, {"load": 99999, "last_ok": 0})
+            added.append(u)
     return {"added": added}
 
 @app.post("/add_special")
 async def add_special(request: Request):
     require_admin(request)
     data = await request.json()
-    hashes = data.get("hashes", [])
-    for h in hashes:
+    for h in data.get("hashes", []):
         r.sadd("special_hashes", h)
     load_special_hashes()
-    return {"added": hashes}
+    return {"added": data.get("hashes", [])}
 
 @app.get("/dl/{hash}/{filename:path}")
 async def dl(hash: str, filename: str, request: Request):
@@ -221,9 +266,11 @@ async def dl(hash: str, filename: str, request: Request):
         return RedirectResponse(TG_REDIRECT, status_code=302)
     if record_ip(request.client.host, hash) > MAX_REQUESTS_PER_IP:
         return JSONResponse({"error": "IP limit exceeded"}, status_code=429)
+
     cdn = get_best_cdn()
     if not cdn:
         return JSONResponse({"error": "No CDN online"}, status_code=503)
+
     return RedirectResponse(f"{cdn}/dl/{hash}/{filename}", status_code=REDIRECT_CODE)
 
 @app.get("/watch/{hash}/{filename:path}")
@@ -232,15 +279,17 @@ async def watch(hash: str, filename: str, request: Request):
         return RedirectResponse(TG_REDIRECT, status_code=302)
     if record_ip(request.client.host, hash) > MAX_REQUESTS_PER_IP:
         return JSONResponse({"error": "IP limit exceeded"}, status_code=429)
+
     cdn = get_best_cdn()
     if not cdn:
         return JSONResponse({"error": "No CDN online"}, status_code=503)
+
     return RedirectResponse(f"{cdn}/watch/{hash}/{filename}", status_code=REDIRECT_CODE)
 
 @app.get("/stats")
 async def stats(request: Request):
     require_admin(request)
-    cdns = [{"url": url, **meta} for url, meta in list_cdns().items()]
+    cdns = [{"url": u, **m} for u, m in list_cdns().items()]
     return {
         "cdns": cdns,
         "best_cdn": BEST_CDN["url"],
