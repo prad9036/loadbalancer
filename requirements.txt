@@ -1,3 +1,4 @@
+httpx
 redis
 lmdb
 uvicorn
