@@ -7,16 +7,7 @@ import math
 import requests
 import redis
 import lmdb
-<<<<<<< HEAD
-import json
-import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import RedirectResponse, JSONResponse
-from dotenv import load_dotenv
-=======
-from concurrent.futures import ThreadPoolExecutor, as_completed
->>>>>>> 4d67143 (Add CDN health checking with automatic purge and streaming support)
 from urllib.parse import urlparse
 
 import httpx
@@ -71,17 +62,12 @@ r = redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else Non
 SPECIAL_CACHE = {"set": set()}
 
 def load_special_hashes():
-<<<<<<< HEAD
-    try:
-        SPECIAL_CACHE["set"] = set(r.smembers("special_hashes"))
-        dbg("Loaded special hashes:", len(SPECIAL_CACHE["set"]))
-=======
     if not r:
         SPECIAL_CACHE["set"] = set()
         return
     try:
         SPECIAL_CACHE["set"] = set(r.smembers("special_hashes"))
->>>>>>> 4d67143 (Add CDN health checking with automatic purge and streaming support)
+        dbg("Loaded special hashes:", len(SPECIAL_CACHE["set"]))
     except Exception as e:
         dbg("Redis error:", e)
 
@@ -102,26 +88,17 @@ def is_special(h: str) -> bool:
 # ============================================================
 
 LMDB_PATH = "cdn.lmdb"
-<<<<<<< HEAD
 LMDB_MAP_SIZE = 512 * 1024 * 1024  # 512MB
-=======
-LMDB_MAP_SIZE = 512 * 1024 * 1024
 
->>>>>>> 4d67143 (Add CDN health checking with automatic purge and streaming support)
 _env = lmdb.open(
     LMDB_PATH,
     map_size=LMDB_MAP_SIZE,
     max_dbs=1,
     lock=True,
     sync=False,
-<<<<<<< HEAD
     readahead=False
 )
-=======
-    readahead=False,
-)
 
->>>>>>> 4d67143 (Add CDN health checking with automatic purge and streaming support)
 _lmdb_lock = threading.Lock()
 
 def set_cdn(url: str, data: dict):
@@ -201,24 +178,8 @@ def get_best_cdn():
     if not online:
         return None
 
-<<<<<<< HEAD
-    min_load = min(meta.get("load", 99999) for _, meta in online)
-
-    # tolerance allows "almost same load" to share traffic
-    TOLERANCE = 1
-    candidates = [
-        url for url, meta in online
-        if abs(meta.get("load", 99999) - min_load) <= TOLERANCE
-    ]
-
-    chosen = random.choice(candidates)
-    BEST_CDN["url"] = chosen
-    BEST_CDN["ts"] = now
-    return chosen
-=======
     min_load = min(m.get("load", 99999) for _, m in online)
     candidates = [u for u, m in online if abs(m.get("load", 99999) - min_load) <= 1]
->>>>>>> 4d67143 (Add CDN health checking with automatic purge and streaming support)
 
     chosen = random.choice(candidates)
     BEST_CDN.update(url=chosen, ts=now)
@@ -242,12 +203,9 @@ def referer_blocked(request: Request) -> bool:
         return False
 
     host = (urlparse(ref).hostname or "").lower()
-<<<<<<< HEAD
-=======
     if host in TRUSTED_HOSTS:
         return False
 
->>>>>>> 4d67143 (Add CDN health checking with automatic purge and streaming support)
     return not any(
         host == w or host.endswith("." + w)
         for w in REFERER_WHITELIST
@@ -258,25 +216,11 @@ def require_admin(request: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 # ============================================================
-<<<<<<< HEAD
-# PARALLEL POLLER (LEADER ONLY)
-=======
 # CDN POLLER WITH PURGE
->>>>>>> 4d67143 (Add CDN health checking with automatic purge and streaming support)
 # ============================================================
 
 IS_LEADER = os.getenv("KOYEB_INSTANCE_ID", "").endswith("0")
 
-<<<<<<< HEAD
-def check_cdn(url):
-    now = int(time.time())
-    try:
-        resp = requests.get(f"{url}/status", timeout=(2, 3))
-        js = resp.json()
-        loads = js.get("loads", {})
-        total = sum(loads.values()) if isinstance(loads, dict) else 99999
-
-=======
 def check_cdn(url: str):
     now = int(time.time())
     try:
@@ -284,26 +228,11 @@ def check_cdn(url: str):
         js = r.json()
         loads = js.get("loads", {})
         total = sum(loads.values()) if isinstance(loads, dict) else 99999
->>>>>>> 4d67143 (Add CDN health checking with automatic purge and streaming support)
         return {"url": url, "ok": True, "load": total, "ts": now}
     except Exception:
         return {"url": url, "ok": False, "load": 99999, "ts": now}
 
 def poller():
-<<<<<<< HEAD
-    executor = ThreadPoolExecutor(max_workers=16)
-
-    while True:
-        cdns = list_cdns()
-        futures = [executor.submit(check_cdn, url) for url in cdns.keys()]
-
-        best_load = None
-        best_urls = []
-
-        for fut in as_completed(futures):
-            res = fut.result()
-            url = res["url"]
-=======
     pool = ThreadPoolExecutor(max_workers=16)
 
     while True:
@@ -315,32 +244,11 @@ def poller():
             url = res["url"]
             prev = cdns.get(url, {})
             fail_count = prev.get("fail_count", 0)
->>>>>>> 4d67143 (Add CDN health checking with automatic purge and streaming support)
 
             if res["ok"]:
                 set_cdn(url, {
                     "load": res["load"],
                     "last_ok": 1,
-<<<<<<< HEAD
-                    "updated_at": res["ts"]
-                })
-
-                if best_load is None or res["load"] < best_load:
-                    best_load = res["load"]
-                    best_urls = [url]
-                elif res["load"] == best_load:
-                    best_urls.append(url)
-            else:
-                set_cdn(url, {
-                    "load": 99999,
-                    "last_ok": 0,
-                    "updated_at": res["ts"]
-                })
-
-        if best_urls:
-            BEST_CDN["url"] = random.choice(best_urls)
-            BEST_CDN["ts"] = time.time()
-=======
                     "fail_count": 0,
                     "updated_at": res["ts"],
                 })
@@ -357,7 +265,6 @@ def poller():
                     "fail_count": fail_count,
                     "updated_at": res["ts"],
                 })
->>>>>>> 4d67143 (Add CDN health checking with automatic purge and streaming support)
 
         rebuild_trusted_hosts()
         time.sleep(POLL_INTERVAL)
@@ -386,19 +293,11 @@ async def health():
 @app.post("/add_cdn")
 async def add_cdn(request: Request):
     require_admin(request)
-    data = await request.json()
     added = []
-<<<<<<< HEAD
-    for u in data.get("urls", []):
+
+    for u in (await request.json()).get("urls", []):
         u = u.rstrip("/")
         if u.startswith("http") and not get_cdn(u):
-            set_cdn(u, {"load": 99999, "last_ok": 0})
-            added.append(u)
-=======
-
-    for u in data.get("urls", []):
-        u = u.rstrip("/")
-        if u.startswith("http"):
             set_cdn(u, {
                 "load": 99999,
                 "last_ok": 0,
@@ -407,21 +306,15 @@ async def add_cdn(request: Request):
             added.append(u)
 
     rebuild_trusted_hosts()
->>>>>>> 4d67143 (Add CDN health checking with automatic purge and streaming support)
     return {"added": added}
 
 @app.post("/add_special")
 async def add_special(request: Request):
     require_admin(request)
     data = await request.json()
-<<<<<<< HEAD
-    for h in data.get("hashes", []):
-        r.sadd("special_hashes", h)
-=======
     if r:
         for h in data.get("hashes", []):
             r.sadd("special_hashes", h)
->>>>>>> 4d67143 (Add CDN health checking with automatic purge and streaming support)
     load_special_hashes()
     return {"added": data.get("hashes", [])}
 
@@ -451,9 +344,6 @@ async def watch(hash: str, filename: str, request: Request):
     if not cdn:
         return JSONResponse({"error": "No CDN online"}, status_code=503)
 
-<<<<<<< HEAD
-    return RedirectResponse(f"{cdn}/watch/{hash}/{filename}", status_code=REDIRECT_CODE)
-=======
     headers = dict(request.headers)
     headers.pop("host", None)
 
@@ -461,14 +351,10 @@ async def watch(hash: str, filename: str, request: Request):
         stream_upstream(f"{cdn}/watch/{hash}/{filename}", headers),
         media_type=None,
     )
->>>>>>> 4d67143 (Add CDN health checking with automatic purge and streaming support)
 
 @app.get("/stats")
 async def stats(request: Request):
     require_admin(request)
-<<<<<<< HEAD
-    cdns = [{"url": u, **m} for u, m in list_cdns().items()]
-=======
 
     cdns = []
     for url, meta in list_cdns().items():
@@ -477,7 +363,6 @@ async def stats(request: Request):
         m["fail_count"] = f"{fc}/{FAIL_THRESHOLD}"
         cdns.append({"url": url, **m})
 
->>>>>>> 4d67143 (Add CDN health checking with automatic purge and streaming support)
     return {
         "cdns": cdns,
         "trusted_hosts": sorted(TRUSTED_HOSTS),
