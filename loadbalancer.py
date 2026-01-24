@@ -332,6 +332,38 @@ async def dl(hash: str, filename: str, request: Request):
 
     return RedirectResponse(f"{cdn}/dl/{hash}/{filename}", status_code=REDIRECT_CODE)
 
+import re
+
+def fix_video_src(html: str, hash: str, filename: str) -> str:
+    """
+    Rewrite /dl/<hash> → /dl/<hash>/<filename>
+    ONLY if filename is missing.
+    Idempotent and future-safe.
+    """
+    pattern = re.compile(rf"/dl/{re.escape(hash)}(?!/)")
+    return pattern.sub(f"/dl/{hash}/{filename}", html)
+
+async def stream_upstream(url: str, headers: dict, hash: str, filename: str):
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream("GET", url, headers=headers) as r:
+            content_type = r.headers.get("content-type", "")
+
+            if "text/html" in content_type:
+                body = b""
+                async for chunk in r.aiter_bytes():
+                    body += chunk
+
+                html = body.decode("utf-8", errors="ignore")
+
+                # CONDITIONAL FIX
+                html = fix_video_src(html, hash, filename)
+
+                yield html.encode("utf-8")
+            else:
+                async for chunk in r.aiter_bytes():
+                    yield chunk
+
+
 @app.get("/watch/{hash}/{filename:path}")
 async def watch(hash: str, filename: str, request: Request):
     if referer_blocked(request) or is_special(hash):
@@ -344,13 +376,16 @@ async def watch(hash: str, filename: str, request: Request):
     if not cdn:
         return JSONResponse({"error": "No CDN online"}, status_code=503)
 
+    upstream_url = f"{cdn}/watch/{hash}/{filename}"
+
     headers = dict(request.headers)
     headers.pop("host", None)
 
     return StreamingResponse(
-        stream_upstream(f"{cdn}/watch/{hash}/{filename}", headers),
-        media_type=None,
+        stream_upstream(upstream_url, headers, hash, filename),
+        media_type=None
     )
+
 
 @app.get("/stats")
 async def stats(request: Request):
