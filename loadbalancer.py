@@ -29,10 +29,10 @@ ADMIN_KEY = os.getenv("LB_ADMIN_KEY", "")
 REDIS_URL = os.getenv("REDIS_URL")
 TG_REDIRECT = "https://t.me/ppsl24_bot"
 
-MAX_REQUESTS_PER_IP = int(os.getenv("LB_MAX_REQUESTS_PER_IP", "10"))
+MAX_REQUESTS_PER_IP = int(os.getenv("LB_MAX_REQUESTS_PER_IP", "100"))
 TTL_SECONDS = int(os.getenv("LB_TTL_SECONDS", "18000"))
-POLL_INTERVAL = int(os.getenv("LB_POLL_INTERVAL", "10"))
-REDIRECT_CODE = int(os.getenv("LB_REDIRECT_CODE", "302"))
+POLL_INTERVAL = int(os.getenv("LB_POLL_INTERVAL", "5"))
+REDIRECT_CODE = int(os.getenv("LB_REDIRECT_CODE", "307"))
 
 FAIL_THRESHOLD = math.ceil((5 * 60) / POLL_INTERVAL)
 
@@ -165,7 +165,7 @@ rebuild_trusted_hosts()
 # ============================================================
 
 BEST_CDN = {"url": None, "ts": 0}
-BEST_CDN_TTL = 10  # seconds
+BEST_CDN_TTL = 4  # seconds
 LOCAL_RL = {}
 
 def get_best_cdn():
