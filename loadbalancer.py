@@ -27,7 +27,7 @@ load_dotenv()
 
 ADMIN_KEY = os.getenv("LB_ADMIN_KEY", "")
 REDIS_URL = os.getenv("REDIS_URL")
-TG_REDIRECT = "https://t.me/ppsl24_bot"
+TG_REDIRECT = os.getenv("REDIRECT_TO", "https://t.me/ppsl24_bot")
 
 MAX_REQUESTS_PER_IP = int(os.getenv("LB_MAX_REQUESTS_PER_IP", "100"))
 TTL_SECONDS = int(os.getenv("LB_TTL_SECONDS", "18000"))
