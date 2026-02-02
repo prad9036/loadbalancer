@@ -24,6 +24,8 @@ load_dotenv()
 # ============================================================
 # CONFIG
 # ============================================================
+AROLINKS_API = os.getenv("AROLINKS_API_TOKEN")
+AROLINKS_ENDPOINT = "https://arolinks.com/api"
 
 ADMIN_KEY = os.getenv("LB_ADMIN_KEY", "")
 REDIS_URL = os.getenv("REDIS_URL")
@@ -318,10 +320,55 @@ async def add_special(request: Request):
     load_special_hashes()
     return {"added": data.get("hashes", [])}
 
+
+
+
+def get_clicked_url(request: Request) -> str:
+    """
+    Returns the exact URL the user clicked, WITHOUT scheme.
+    Example:
+      https://fcdn.koyeb.app/dl/x/y.mkv
+      -> fcdn.koyeb.app/dl/x/y.mkv
+    """
+    return str(request.url).split("://", 1)[-1]
+
+
+def arolinks_shorten(raw_url: str) -> str | None:
+    try:
+        r = requests.get(
+            AROLINKS_ENDPOINT,
+            params={
+                "api": AROLINKS_API,
+                "url": raw_url,
+            },
+            timeout=5,
+        )
+        js = r.json()
+        if js.get("status") == "success":
+            return js.get("shortenedUrl")
+    except Exception as e:
+        dbg("Arolinks error:", e)
+    return None
+
+
+def redirect_via_ads_or_bot(request: Request):
+    """
+    1. Try Arolinks with clicked URL
+    2. If it fails → redirect to Telegram bot
+    """
+    raw_url = get_clicked_url(request)
+    short = arolinks_shorten(raw_url)
+
+    if short:
+        return RedirectResponse(short, status_code=302)
+
+    return RedirectResponse(TG_REDIRECT, status_code=302)
+
+
 @app.get("/dl/{hash}/{filename:path}")
 async def dl(hash: str, filename: str, request: Request):
     if referer_blocked(request) or is_special(hash):
-        return RedirectResponse(TG_REDIRECT, status_code=302)
+        return redirect_via_ads_or_bot(request)
 
     if record_ip(request.client.host, hash) > MAX_REQUESTS_PER_IP:
         return JSONResponse({"error": "IP limit exceeded"}, status_code=429)
@@ -330,7 +377,10 @@ async def dl(hash: str, filename: str, request: Request):
     if not cdn:
         return JSONResponse({"error": "No CDN online"}, status_code=503)
 
-    return RedirectResponse(f"{cdn}/dl/{hash}/{filename}", status_code=REDIRECT_CODE)
+    return RedirectResponse(
+        f"{cdn}/dl/{hash}/{filename}",
+        status_code=REDIRECT_CODE
+    )
 
 import re
 
@@ -367,7 +417,7 @@ async def stream_upstream(url: str, headers: dict, hash: str, filename: str):
 @app.get("/watch/{hash}/{filename:path}")
 async def watch(hash: str, filename: str, request: Request):
     if referer_blocked(request) or is_special(hash):
-        return RedirectResponse(TG_REDIRECT, status_code=302)
+        return redirect_via_ads_or_bot(request)
 
     if record_ip(request.client.host, hash) > MAX_REQUESTS_PER_IP:
         return JSONResponse({"error": "IP limit exceeded"}, status_code=429)
@@ -377,7 +427,6 @@ async def watch(hash: str, filename: str, request: Request):
         return JSONResponse({"error": "No CDN online"}, status_code=503)
 
     upstream_url = f"{cdn}/watch/{hash}/{filename}"
-
     headers = dict(request.headers)
     headers.pop("host", None)
 
